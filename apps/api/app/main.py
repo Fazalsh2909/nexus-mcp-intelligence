@@ -19,6 +19,9 @@ rate_limit_store: dict[str, list[float]] = defaultdict(list)
 async def lifespan(app: FastAPI):
     setup_logging()
     yield
+    from app.orchestration import mcp_client
+
+    await mcp_client.close_all()
     await engine.dispose()
 
 

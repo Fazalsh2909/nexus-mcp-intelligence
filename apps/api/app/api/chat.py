@@ -26,7 +26,12 @@ from app.schemas.schemas import (
     ToolActivity,
 )
 from app.api.auth import get_current_user
-from app.orchestration.engine import orchestrate
+from app.orchestration.engine import (
+    orchestrate,
+    confirm_action,
+    reject_action,
+    arguments_hash,
+)
 
 router = APIRouter()
 
@@ -234,6 +239,7 @@ async def send_message(
                         message_id=assistant_msg.id,
                         tool_name=event["tool"],
                         arguments_json=event.get("arguments", {}),
+                        arguments_hash=arguments_hash(event.get("arguments", {})),
                         status="running",
                     )
                     tool_call_objects.append(tool_call)
@@ -272,6 +278,8 @@ async def send_message(
                         await db.commit()
                         last_flushed = len(full_response)
                     yield f"data: {json.dumps({'type': 'token', 'content': event['content']})}\n\n"
+                elif event["type"] == "confirmation_request":
+                    yield f"data: {json.dumps({'type': 'confirmation_request', 'action_id': event['action_id'], 'tool': event['tool'], 'description': event['description'], 'arguments': event['arguments']})}\n\n"
                 elif event["type"] == "sources":
                     yield f"data: {json.dumps({'type': 'sources', 'sources': event['sources']})}\n\n"
                 elif event["type"] == "usage":
@@ -316,3 +324,136 @@ async def send_message(
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/sessions/{session_id}/actions/{action_id}/confirm")
+async def confirm_action_endpoint(
+    session_id: UUID,
+    action_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    async def event_stream():
+        tool_activities = []
+        tool_call_objects = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+        completed = False
+
+        assistant_msg = Message(
+            chat_session_id=session.id,
+            role="assistant",
+            content="",
+        )
+        db.add(assistant_msg)
+        await db.flush()
+        await db.commit()
+
+        try:
+            async for event in confirm_action(
+                action_id=str(action_id),
+                session_id=str(session.id),
+                user_id=str(user.id),
+                organization_id=str(user.organization_id),
+                db=db,
+            ):
+                if event["type"] == "thinking":
+                    yield f"data: {json.dumps({'type': 'thinking', 'content': event['content']})}\n\n"
+                elif event["type"] == "tool_start":
+                    tool_activities.append(event)
+                    tool_call = ToolCall(
+                        message_id=assistant_msg.id,
+                        tool_name=event["tool"],
+                        arguments_json=event.get("arguments", {}),
+                        arguments_hash=arguments_hash(event.get("arguments", {})),
+                        status="running",
+                    )
+                    tool_call_objects.append(tool_call)
+                    db.add(tool_call)
+                    yield f"data: {json.dumps({'type': 'tool_start', 'tool': event['tool'], 'description': event.get('description', '')})}\n\n"
+                elif event["type"] == "tool_result":
+                    for tc in tool_call_objects:
+                        if tc.tool_name == event["tool"] and tc.status == "running":
+                            tc.status = "success"
+                            tc.duration_ms = event.get("duration_ms")
+                    yield f"data: {json.dumps({'type': 'tool_result', 'tool': event['tool'], 'duration_ms': event.get('duration_ms', 0)})}\n\n"
+                elif event["type"] == "tool_error":
+                    for tc in tool_call_objects:
+                        if tc.tool_name == event["tool"] and tc.status == "running":
+                            tc.status = "error"
+                            tc.error_message = event.get("error")
+                    yield f"data: {json.dumps({'type': 'tool_error', 'tool': event['tool'], 'error': event.get('error', '')})}\n\n"
+                elif event["type"] == "token":
+                    assistant_msg.content += event["content"]
+                    yield f"data: {json.dumps({'type': 'token', 'content': event['content']})}\n\n"
+                elif event["type"] == "sources":
+                    yield f"data: {json.dumps({'type': 'sources', 'sources': event['sources']})}\n\n"
+                elif event["type"] == "usage":
+                    total_input_tokens = int(event.get("input_tokens") or 0)
+                    total_output_tokens = int(event.get("output_tokens") or 0)
+                elif event["type"] == "error":
+                    yield f"data: {json.dumps({'type': 'error', 'content': event['content']})}\n\n"
+                elif event["type"] == "done":
+                    completed = True
+                    break
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("Confirm stream error")
+            yield f"data: {json.dumps({'type': 'error', 'content': 'An internal error occurred. Please try again.'})}\n\n"
+        finally:
+            try:
+                assistant_msg.sources_json = (
+                    [a for a in tool_activities] if tool_activities else None
+                )
+                session.updated_at = datetime.utcnow()
+                db.add(
+                    UsageEvent(
+                        user_id=user.id,
+                        organization_id=user.organization_id,
+                        event_type="chat" if completed else "error",
+                        model=settings.LLM_MODEL,
+                        input_tokens=total_input_tokens,
+                        output_tokens=total_output_tokens,
+                    )
+                )
+                await db.flush()
+                await db.commit()
+            except BaseException:
+                pass
+
+        if completed:
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/sessions/{session_id}/actions/{action_id}/cancel")
+async def cancel_action_endpoint(
+    session_id: UUID,
+    action_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    cancelled = await reject_action(str(action_id), str(session.id), str(user.id), db)
+    if not cancelled:
+        raise HTTPException(status_code=409, detail="Action already handled")
+    return {"status": "rejected", "action_id": str(action_id)}

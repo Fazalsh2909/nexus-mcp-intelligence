@@ -1,16 +1,22 @@
+import hashlib
+import secrets
 import urllib.parse
+from datetime import datetime, timedelta
+
 import httpx
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.crypto import encrypt_credentials
 from app.db.session import get_db
-from app.models.models import Connection, User
+from app.models.models import Connection, OAuthState, User
 from app.schemas.schemas import ConnectionResponse
 from app.api.auth import get_current_user
+from app.orchestration.credentials import resolve_credential, resolve_slack_tokens
 
 router = APIRouter()
 
@@ -31,6 +37,8 @@ TOKEN_URLS = {
     "slack": "https://slack.com/api/oauth.v2.access",
     "hubspot": "https://api.hubapi.com/oauth/v1/token",
 }
+
+STATE_TTL = timedelta(minutes=10)
 
 
 def _env_credential(integration_type: str) -> str:
@@ -56,7 +64,12 @@ async def list_connections(
         conn = by_type.get(integration_type)
         token = (conn.metadata_json or {}).get("access_token", "") if conn else ""
         bot_token = (conn.metadata_json or {}).get("bot_token", "") if conn else ""
-        has_credential = bool(_env_credential(integration_type) or token or bot_token)
+        has_credential = bool(
+            _env_credential(integration_type)
+            or (conn.encrypted_credentials if conn else "")
+            or token
+            or bot_token
+        )
 
         if conn is None:
             if has_credential:
@@ -68,7 +81,7 @@ async def list_connections(
                     )
                 )
                 changed = True
-        elif conn.status == "pending" and not token and not bot_token:
+        elif conn.status == "pending":
             # A Connect click that never completed OAuth has no credential.
             conn.status = "connected" if has_credential else "disconnected"
             changed = True
@@ -113,6 +126,21 @@ async def authorize_source(
         db.add(conn)
     else:
         conn.status = "pending"
+
+    # Single-use, expiring CSRF state: only its SHA-256 hash is persisted, so
+    # a database read cannot forge an authorization link.
+    await db.execute(
+        delete(OAuthState).where(OAuthState.expires_at < datetime.utcnow())
+    )
+    state = secrets.token_urlsafe(32)
+    db.add(
+        OAuthState(
+            state_hash=hashlib.sha256(state.encode()).hexdigest(),
+            user_id=user.id,
+            provider=integration_type,
+            expires_at=datetime.utcnow() + STATE_TTL,
+        )
+    )
     await db.commit()
 
     if integration_type == "github":
@@ -120,21 +148,21 @@ async def authorize_source(
             "client_id": settings.GITHUB_CLIENT_ID,
             "redirect_uri": settings.GITHUB_REDIRECT_URI,
             "scope": OAUTH_SCOPES["github"],
-            "state": str(user.id),
+            "state": state,
         }
     elif integration_type == "slack":
         params = {
             "client_id": settings.SLACK_CLIENT_ID,
             "redirect_uri": settings.SLACK_REDIRECT_URI,
             "scope": OAUTH_SCOPES["slack"],
-            "state": str(user.id),
+            "state": state,
         }
     else:
         params = {
             "client_id": settings.HUBSPOT_CLIENT_ID,
             "redirect_uri": settings.HUBSPOT_REDIRECT_URI,
             "scope": OAUTH_SCOPES["hubspot"],
-            "state": str(user.id),
+            "state": state,
         }
 
     url = f"{AUTHORIZE_URLS[integration_type]}?{urllib.parse.urlencode(params)}"
@@ -160,6 +188,28 @@ async def oauth_callback(
             f"{settings.FRONTEND_URL}/sources?error={urllib.parse.quote(error)}"
         )
 
+    if not state:
+        return RedirectResponse(f"{settings.FRONTEND_URL}/sources?error=missing_state")
+
+    state_result = await db.execute(
+        select(OAuthState).where(
+            OAuthState.state_hash == hashlib.sha256(state.encode()).hexdigest()
+        )
+    )
+    oauth_state = state_result.scalar_one_or_none()
+    if (
+        oauth_state is None
+        or oauth_state.used
+        or oauth_state.provider != integration_type
+        or oauth_state.expires_at < datetime.utcnow()
+    ):
+        return RedirectResponse(f"{settings.FRONTEND_URL}/sources?error=invalid_state")
+
+    # The state record is single-use: consume it before exchanging the code.
+    oauth_state.used = True
+    await db.commit()
+
+    user_id = str(oauth_state.user_id)
     client_id = getattr(settings, f"{integration_type.upper()}_CLIENT_ID", "")
     client_secret = getattr(settings, f"{integration_type.upper()}_CLIENT_SECRET", "")
     redirect_uri = getattr(settings, f"{integration_type.upper()}_REDIRECT_URI", "")
@@ -211,26 +261,33 @@ async def oauth_callback(
 
     result = await db.execute(
         select(Connection).where(
-            Connection.user_id == str(state),
+            Connection.user_id == user_id,
             Connection.integration_type == integration_type,
         )
     )
     conn = result.scalar_one_or_none()
     if conn is None:
         conn = Connection(
-            user_id=str(state),
+            user_id=user_id,
             integration_type=integration_type,
             status="connected",
         )
         db.add(conn)
 
-    metadata = dict(conn.metadata_json or {})
-    metadata["access_token"] = access_token
+    # Tokens are encrypted at rest; only non-secret metadata stays in JSON.
+    payload = {"access_token": access_token}
     if integration_type == "slack":
-        metadata["bot_token"] = bot_token or access_token
-        metadata["team_name"] = team.get("name", "")
+        payload["bot_token"] = bot_token or access_token
     if integration_type == "hubspot":
-        metadata["refresh_token"] = refresh_token
+        payload["refresh_token"] = refresh_token
+    conn.encrypted_credentials = encrypt_credentials(payload)
+
+    metadata = dict(conn.metadata_json or {})
+    metadata.pop("access_token", None)
+    metadata.pop("bot_token", None)
+    metadata.pop("refresh_token", None)
+    if integration_type == "slack":
+        metadata["team_name"] = team.get("name", "")
     conn.metadata_json = metadata
     conn.status = "connected"
     await db.commit()
@@ -294,6 +351,7 @@ async def disconnect_source(
     conn = result.scalar_one_or_none()
     if conn:
         conn.status = "disconnected"
+        conn.encrypted_credentials = None
         conn.metadata_json = {}
         await db.flush()
     return {"status": "disconnected", "integration_type": integration_type}
@@ -308,18 +366,13 @@ async def test_connection(
     """Actually verify the credential with a real, read-only API call."""
     try:
         if integration_type == "github":
-            token = settings.GITHUB_PERSONAL_ACCESS_TOKEN
-            if not token:
-                result = await db.execute(
-                    select(Connection).where(
-                        Connection.user_id == user.id,
-                        Connection.integration_type == "github",
-                    )
-                )
-                conn = result.scalar_one_or_none()
-                token = (
-                    (conn.metadata_json or {}).get("access_token", "") if conn else ""
-                )
+            token = await resolve_credential(
+                db,
+                str(user.id),
+                "github",
+                settings.GITHUB_PERSONAL_ACCESS_TOKEN,
+                ("access_token",),
+            )
             if not token:
                 return {"status": "error", "message": "No GitHub credential found"}
             async with httpx.AsyncClient(timeout=10) as client:
@@ -338,16 +391,8 @@ async def test_connection(
             }
 
         if integration_type == "slack":
-            token = settings.SLACK_BOT_TOKEN
-            if not token:
-                result = await db.execute(
-                    select(Connection).where(
-                        Connection.user_id == user.id,
-                        Connection.integration_type == "slack",
-                    )
-                )
-                conn = result.scalar_one_or_none()
-                token = (conn.metadata_json or {}).get("bot_token", "") if conn else ""
+            creds = await resolve_slack_tokens(db, str(user.id))
+            token = creds.get("bot_token", "")
             if not token:
                 return {"status": "error", "message": "No Slack credential found"}
             async with httpx.AsyncClient(timeout=10) as client:
@@ -364,18 +409,13 @@ async def test_connection(
             }
 
         if integration_type == "hubspot":
-            token = settings.HUBSPOT_ACCESS_TOKEN
-            if not token:
-                result = await db.execute(
-                    select(Connection).where(
-                        Connection.user_id == user.id,
-                        Connection.integration_type == "hubspot",
-                    )
-                )
-                conn = result.scalar_one_or_none()
-                token = (
-                    (conn.metadata_json or {}).get("access_token", "") if conn else ""
-                )
+            token = await resolve_credential(
+                db,
+                str(user.id),
+                "hubspot",
+                settings.HUBSPOT_ACCESS_TOKEN,
+                ("access_token",),
+            )
             if not token:
                 return {"status": "error", "message": "No HubSpot credential found"}
             async with httpx.AsyncClient(timeout=10) as client:

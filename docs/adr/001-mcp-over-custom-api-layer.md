@@ -1,8 +1,8 @@
-# ADR 001: Use MCP Over Custom API Layer
+# ADR 001: Use the MCP Protocol with the Official SDK
 
 ## Status
 
-Accepted
+Accepted (supersedes the initial custom-API approach)
 
 ## Context
 
@@ -14,7 +14,16 @@ Nexus needs a standard way for the AI orchestrator to communicate with multiple 
 
 ## Decision
 
-Use the Model Context Protocol (MCP) with the official `@modelcontextprotocol/sdk` TypeScript SDK.
+Use the Model Context Protocol (MCP) with the official Python SDK (`mcp==1.29.0`). Each integration is a standalone MCP server process exposing a real `tools/list` / `tools/call` interface over stdio:
+
+- `app/mcp_servers/slack_server.py`
+- `app/mcp_servers/github_server.py`
+- `app/mcp_servers/hubspot_server.py`
+- `app/mcp_servers/postgres_server.py`
+
+The backend spawns and manages these processes through an in-process gateway (`app/orchestration/mcp_client.py`), which routes every tool call as an MCP `tools/call` request and injects the caller's identity as a reserved `__user_id__` argument that the servers strip before dispatch. Because the servers are ordinary stdio MCP servers, any MCP client (e.g. Claude Desktop) can connect to them directly with `python -m app.mcp_servers.<name>`.
+
+On Windows, each server process is terminated explicitly by PID (via a PID-file handshake) on shutdown, because stdio children do not reliably exit when stdin closes.
 
 ## Alternatives Considered
 
@@ -56,8 +65,9 @@ MCP adds a protocol layer but provides:
 
 ## Consequences
 
-- Each integration is an independent MCP tool module
-- Adding new integrations follows a standard pattern
+- Each integration is an independent MCP server process with a standard entry point
+- Adding new integrations follows a standard pattern (`*_tools.py` handler module + `*_server.py` process + gateway route)
 - Tool definitions are self-documenting
 - Can swap LLM providers without changing tool interfaces
+- The test suite verifies MCP discovery parity against the registry and exercises real `tools/call` round-trips
 - Initial setup requires understanding MCP patterns

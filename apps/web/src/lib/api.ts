@@ -42,6 +42,13 @@ export interface ToolExecution {
   created_at: string
 }
 
+export interface ConfirmationRequest {
+  action_id: string
+  tool: string
+  description: string
+  arguments: Record<string, unknown>
+}
+
 export interface Analytics {
   total_queries: number
   successful_queries: number
@@ -87,6 +94,47 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     throw err
   }
   return res.json()
+}
+
+async function* stream(path: string, body: Record<string, unknown>) {
+  const token = localStorage.getItem('nexus_token')
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+
+  handleUnauthorized(res.status)
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: 'Request failed' }))
+    const err = new Error(error.detail || `HTTP ${res.status}`) as Error & { status?: number }
+    err.status = res.status
+    throw err
+  }
+
+  const reader = res.body?.getReader()
+  if (!reader) return
+
+  const decoder = new TextDecoder()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    const text = decoder.decode(value)
+    const lines = text.split('\n')
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        try {
+          const event = JSON.parse(line.slice(6))
+          yield event
+        } catch {
+          // ignore malformed SSE events
+        }
+      }
+    }
+  }
 }
 
 export const api = {
@@ -136,45 +184,16 @@ export const api = {
         body: JSON.stringify({ title }),
       }),
     send: async function* (sessionId: string, content: string) {
-      const token = localStorage.getItem('nexus_token')
-      const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/messages`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ content }),
-      })
-
-      handleUnauthorized(res.status)
-      if (!res.ok) {
-        const error = await res.json().catch(() => ({ detail: 'Request failed' }))
-        const err = new Error(error.detail || `HTTP ${res.status}`) as Error & { status?: number }
-        err.status = res.status
-        throw err
-      }
-
-      const reader = res.body?.getReader()
-      if (!reader) return
-
-      const decoder = new TextDecoder()
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        const text = decoder.decode(value)
-        const lines = text.split('\n')
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const event = JSON.parse(line.slice(6))
-              yield event
-            } catch {
-              // ignore malformed SSE events
-            }
-          }
-        }
-      }
+      yield* stream(`/chat/sessions/${sessionId}/messages`, { content })
     },
+    confirm: async function* (sessionId: string, actionId: string) {
+      yield* stream(`/chat/sessions/${sessionId}/actions/${actionId}/confirm`, {})
+    },
+    cancel: (sessionId: string, actionId: string) =>
+      request<{ status: string; action_id: string }>(
+        `/chat/sessions/${sessionId}/actions/${actionId}/cancel`,
+        { method: 'POST' },
+      ),
   },
   analytics: {
     get: () => request<Analytics>('/analytics/'),

@@ -16,6 +16,8 @@ The AI orchestrator intelligently selects which MCP tools to call, executes them
 
 ## Architecture
 
+Nexus runs four dedicated MCP servers (Slack, GitHub, HubSpot, PostgreSQL), each in its own stdio subprocess using the official MCP Python SDK. The backend's MCP gateway spawns and manages those processes, so every integration call is a real `tools/call` request over the MCP protocol — and any MCP client (e.g. Claude Desktop) can connect to the same servers directly with `python -m app.mcp_servers.<name>`.
+
 ```
                 ┌─────────────────────────┐
                 │       React Frontend    │
@@ -24,40 +26,44 @@ The AI orchestrator intelligently selects which MCP tools to call, executes them
                 │ Settings / Observability│
                 └────────────┬────────────┘
                              │
-                          HTTPS
+                          HTTPS/SSE
                              │
                 ┌────────────▼────────────┐
                 │      FastAPI Backend    │
                 │                          │
                 │ Auth / Chat / Sources    │
-                │ Sessions / SSE           │
+                │ Sessions / Confirmation │
                 └────────────┬─────────────┘
                              │
                 ┌────────────▼─────────────┐
                 │     AI Orchestrator      │
                 │                           │
                 │ Intent / Tool Selection  │
-                │ Tool Execution            │
-                │ Context Management       │
-                │ Answer Synthesis          │
+                │ Evidence → Citations     │
+                │ Write-Action Interception│
                 └────────────┬─────────────┘
                              │
-                     MCP Protocol
-                             │
-           ┌─────────────────┼─────────────────┐
-           │                 │                 │
-   ┌───────▼───────┐ ┌──────▼──────┐ ┌──────▼──────┐
-   │ GitHub MCP    │ │ Slack MCP   │ │ HubSpot MCP │
-   │ Server        │ │ Server      │ │ Server      │
-   └───────┬───────┘ └──────┬──────┘ └──────┬──────┘
-           │                │                │
-        GitHub            Slack           HubSpot
-           │                │                │
-           └────────────────┼────────────────┘
+                ┌────────────▼─────────────┐
+                │     MCP Gateway          │
+                │  (spawns stdio servers,  │
+                │   routes tools/call)     │
+                └────────────┬─────────────┘
+                             │    MCP over stdio
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+┌───────▼───────┐   ┌────────▼───────┐   ┌────────▼───────┐
+│ Slack MCP     │   │ GitHub MCP     │   │ HubSpot MCP    │
+│ Server (proc) │   │ Server (proc)  │   │ Server (proc)  │
+└───────┬───────┘   └───────┬────────┘   └───────┬────────┘
+        │                   │                    │
+     Slack               GitHub              HubSpot
+        │                   │                    │
+        └───────────────────┼────────────────────┘
                             │
-                   ┌────────▼────────┐
-                   │ PostgreSQL MCP  │
-                   └────────┬────────┘
+                 ┌──────────▼──────────┐
+                 │ PostgreSQL MCP      │
+                 │ Server (proc)       │
+                 └──────────┬──────────┘
                             │
                        PostgreSQL
 ```
@@ -65,11 +71,14 @@ The AI orchestrator intelligently selects which MCP tools to call, executes them
 ## Features
 
 - **Multi-source AI queries** — Ask questions that span Slack, GitHub, HubSpot, and PostgreSQL
-- **MCP protocol** — Standard tool-calling interface for all integrations
+- **Real MCP** — Each integration is a dedicated MCP server process (official Python SDK, `tools/list`/`tools/call` over stdio) managed by an in-process gateway
+- **Write actions with confirmation** — Write tools (e.g. creating a GitHub issue, adding a HubSpot note) never execute until the user explicitly confirms in the chat UI
 - **Streaming responses** — Real-time answer generation with tool activity trace
 - **Source citations** — Every answer links to its sources (Slack messages, GitHub issues, CRM records)
 - **SQL safety** — Read-only PostgreSQL access with parameterized queries, timeouts, and row limits
 - **Prompt injection defense** — External content treated as untrusted data
+- **Credential security** — OAuth flows protected by single-use, expiring hashed CSRF state; tokens encrypted at rest with Fernet
+- **Evaluation suite** — A scenario runner (`tests/evaluation/runner.py`) scores tool selection and answer grounding across 40 scenarios
 - **Analytics dashboard** — Query metrics, latency, cost tracking, tool usage
 - **Real integrations** — Live GitHub, Slack, HubSpot, and PostgreSQL connections via OAuth or API tokens
 
@@ -79,9 +88,9 @@ The AI orchestrator intelligently selects which MCP tools to call, executes them
 |-------|-----------|
 | Frontend | React, TypeScript, Vite, Tailwind CSS, shadcn/ui, TanStack Query |
 | Backend | Python 3.12, FastAPI, Pydantic, SQLAlchemy, Alembic |
-| Database | PostgreSQL 16 |
+| MCP | Official MCP Python SDK (`mcp==1.29.0`) — 4 stdio server processes |
+| Database | PostgreSQL 15 |
 | Cache | Redis 7 |
-| MCP Servers | Native HTTP integrations (GitHub, Slack, HubSpot, PostgreSQL) |
 | AI | OpenRouter (configurable — supports OpenAI, Anthropic, Groq) |
 | Infrastructure | Docker, Docker Compose, GitHub Actions |
 
@@ -133,16 +142,16 @@ See [`.env.example`](.env.example) for all configuration options.
 
 Key variables:
 - `LLM_PROVIDER=openrouter` — Use OpenRouter for free LLM access
-- `LLM_MODEL=openai/gpt-oss-20b:free` — Free model with tool calling support
+- `LLM_MODEL=nvidia/nemotron-3-nano-30b-a3b:free` — Free model with tool calling support
 - `DATABASE_URL` — PostgreSQL connection string
 - `JWT_SECRET` — Session signing key
-- `ENCRYPTION_KEY` — Credential encryption key
+- `ENCRYPTION_KEY` — Fernet key for credential encryption at rest
 
 ### LLM Providers
 
 | Provider | Env Var | Free Tier |
 |----------|---------|-----------|
-| OpenRouter | `OPENROUTER_API_KEY` | Yes (`openai/gpt-oss-20b:free`) |
+| OpenRouter | `OPENROUTER_API_KEY` | Yes (daily free-request cap) |
 | Groq | `GROQ_API_KEY` | Yes (rate limited) |
 | OpenAI | `OPENAI_API_KEY` | No |
 | Anthropic | `ANTHROPIC_API_KEY` | No |
@@ -169,11 +178,13 @@ Key variables:
 
 ## Security
 
-- Credentials encrypted at rest with Fernet
+- Credentials encrypted at rest with Fernet (`Connection.encrypted_credentials`)
+- OAuth flows use single-use, expiring state values stored only as SHA-256 hashes
 - OAuth tokens never exposed to frontend
-- PostgreSQL MCP uses read-only database role
+- PostgreSQL MCP uses a table allowlist, read-only queries with DB-side `LIMIT`, and parameter binding
 - SQL injection prevented via parameterized queries
 - Prompt injection defended by content/untrusted-data separation
+- Write actions require explicit user confirmation before execution
 - Rate limiting per user and per organization
 - Structured logging without sensitive data
 
@@ -191,22 +202,39 @@ See [docs/deployment/](docs/deployment/) for:
 - [Security Documentation](docs/security/README.md)
 - [Deployment Guide](docs/deployment/README.md)
 - [Case Study](docs/case-study.md)
+- [Evaluation Suite](apps/api/tests/evaluation/) — scenario runner scoring tool selection and answer grounding
+
+## Testing
+
+```bash
+# Backend (lint, format, types, tests)
+cd apps/api
+ruff check . && ruff format --check . && mypy app/ --ignore-missing-imports
+pytest tests/                      # unit + integration + MCP protocol tests
+
+# Evaluation (real LLM calls; needs provider quota)
+python -m tests.evaluation.runner  # all scenarios
+python -m tests.evaluation.runner slack_  # subset by name prefix
+
+# Frontend
+cd apps/web
+npm run lint && npm run build
+```
 
 ## Limitations
 
 - Rate limits are in-memory — not distributed across instances
 - No enterprise SSO (SAML/OIDC) in initial release
 - HubSpot integration limited to contacts, companies, and deals
+- Slack search requires the bot to be a member of the channels it scans
 
 ## Future Improvements
 
-- Write action confirmation UI
 - Additional MCP connectors (Jira, Linear, Notion, Confluence)
 - Enterprise SSO with SAML/OIDC
 - Distributed rate limiting with Redis
 - Advanced RBAC with permission-aware retrieval
 - Playwright E2E tests
-- Evaluation benchmarking suite
 
 ## License
 

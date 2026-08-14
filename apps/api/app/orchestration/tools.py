@@ -11,6 +11,12 @@ TOOL_MAP = {}
 for tool in TOOL_DEFINITIONS:
     TOOL_MAP[tool["function"]["name"]] = tool
 
+# Write tools mutate external systems and always require human confirmation.
+WRITE_TOOLS = {
+    "github_create_issue",
+    "hubspot_add_contact_note",
+}
+
 
 async def execute_tool(
     tool_name: str,
@@ -19,39 +25,13 @@ async def execute_tool(
     organization_id: str = "",
     db=None,
 ) -> Dict[str, Any]:
-    if tool_name.startswith("slack_"):
-        from app.orchestration.tools_slack import execute_slack_tool
+    """Route a tool call through the provider's MCP server process."""
+    from app.orchestration import mcp_client
 
-        return await execute_slack_tool(
-            tool_name,
-            arguments,
-            user_id=user_id,
-            organization_id=organization_id,
-            db=db,
-        )
-    elif tool_name.startswith("github_"):
-        from app.orchestration.tools_github import execute_github_tool
+    if tool_name not in TOOL_MAP:
+        raise ValueError(f"Unknown tool: {tool_name}")
 
-        return await execute_github_tool(
-            tool_name,
-            arguments,
-            user_id=user_id,
-            organization_id=organization_id,
-            db=db,
-        )
-    elif tool_name.startswith("hubspot_"):
-        from app.orchestration.tools_hubspot import execute_hubspot_tool
-
-        return await execute_hubspot_tool(
-            tool_name,
-            arguments,
-            user_id=user_id,
-            organization_id=organization_id,
-            db=db,
-        )
-    elif tool_name.startswith("postgres_"):
-        from app.orchestration.tools_postgres import execute_postgres_tool
-
-        return await execute_postgres_tool(tool_name, arguments)
-
-    raise ValueError(f"Unknown tool: {tool_name}")
+    try:
+        return await mcp_client.call_tool(tool_name, arguments, user_id=user_id)
+    except Exception as e:
+        return {"error": f"The {tool_name} integration is unavailable right now: {e}"}

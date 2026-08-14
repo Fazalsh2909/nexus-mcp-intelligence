@@ -175,6 +175,7 @@ class ToolCall(Base):
     )
     tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
     arguments_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    arguments_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(
         String(20), default="pending"
     )  # pending, running, success, error
@@ -303,3 +304,46 @@ class EvaluationResult(Base):
     run: Mapped["EvaluationRun"] = relationship(
         "EvaluationRun", back_populates="results"
     )
+
+
+class OAuthState(Base):
+    """Single-use, expiring OAuth state records keyed by a SHA-256 hash of the
+    random state value. Guards against CSRF-style authorization hijacking."""
+
+    __tablename__ = "oauth_states"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=gen_uuid
+    )
+    state_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PendingAction(Base):
+    """A write-action awaiting human confirmation, persisted so the decision
+    is auditable and survives stream reconnects."""
+
+    __tablename__ = "pending_actions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=gen_uuid
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chat_sessions.id"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    arguments_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending"
+    )  # pending, confirmed, rejected, executed
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

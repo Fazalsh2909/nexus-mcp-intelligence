@@ -14,8 +14,11 @@ import {
   Layers,
   CircleDot,
   Pencil,
+  ShieldAlert,
+  Check,
+  Ban,
 } from 'lucide-react'
-import { api, type ChatMessage, type ToolActivity, type SourceRef } from '../lib/api'
+import { api, type ChatMessage, type ToolActivity, type SourceRef, type ConfirmationRequest } from '../lib/api'
 import { timeAgo, formatMs, sourceLabel } from '../lib/format'
 import { Button, StatusDot, SectionLabel, SourceIcon, SourceChip, Kbd } from '../lib/ui'
 import { useWorkspace } from '../lib/workspace'
@@ -179,6 +182,44 @@ function UserMessage({ msg }: { msg: ChatMessage }) {
   )
 }
 
+function ConfirmationCard({
+  pending,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  pending: ConfirmationRequest
+  busy: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  return (
+    <div className="rounded-md border border-warning/30 bg-warning/5 px-3.5 py-3">
+      <div className="flex items-center gap-2 text-[12.5px] font-medium text-foreground">
+        <ShieldAlert className="h-4 w-4 text-warning" />
+        This action needs your confirmation
+      </div>
+      <div className="mt-1.5 space-y-1 text-[12px] text-muted">
+        <div className="mono text-[11px] text-foreground">{pending.tool}</div>
+        <div>{pending.description}</div>
+        <div className="mono overflow-x-auto rounded border border-border bg-background px-2 py-1.5 text-[11px] text-faint">
+          {JSON.stringify(pending.arguments)}
+        </div>
+      </div>
+      <div className="mt-2.5 flex gap-2">
+        <Button size="sm" variant="primary" onClick={onConfirm} disabled={busy} className="gap-1.5">
+          <Check className="h-3.5 w-3.5" />
+          Confirm
+        </Button>
+        <Button size="sm" variant="secondary" onClick={onCancel} disabled={busy} className="gap-1.5">
+          <Ban className="h-3.5 w-3.5" />
+          Decline
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 export default function ChatPage() {
   const { id: sessionId } = useParams()
   const [searchParams] = useSearchParams()
@@ -196,6 +237,8 @@ export default function ChatPage() {
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
   const [thinking, setThinking] = useState(false)
+  const [pendingAction, setPendingAction] = useState<ConfirmationRequest | null>(null)
+  const [isConfirming, setIsConfirming] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const sentRef = useRef(false)
   const assistantIdRef = useRef<string | null>(null)
@@ -230,6 +273,7 @@ export default function ChatPage() {
       setMessages([])
       setToolActivities([])
       setHistoryNote('')
+      setPendingAction(null)
       return
     }
     let cancelled = false
@@ -319,7 +363,7 @@ export default function ChatPage() {
   }, [sessionId, searchParams])
 
   const sendMessage = async (content: string) => {
-    if (!content.trim() || isStreaming) return
+    if (!content.trim() || isStreaming || pendingAction) return
 
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
@@ -389,6 +433,9 @@ export default function ChatPage() {
             }
             return [...prev, { id: aid, role: 'assistant', content: assistantContent }]
           })
+        } else if (event.type === 'confirmation_request') {
+          setThinking(false)
+          setPendingAction(event)
         } else if (event.type === 'sources') {
           const aid = assistantIdRef.current
           if (aid) {
@@ -440,6 +487,104 @@ export default function ChatPage() {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       sendMessage(input)
+    }
+  }
+
+  const handleConfirm = async () => {
+    if (!sessionId || !pendingAction || isConfirming) return
+    setIsConfirming(true)
+    const currentSessionId = sessionId
+    const currentToolActivities: ToolActivity[] = []
+    assistantIdRef.current = null
+    let assistantContent = ''
+
+    try {
+      for await (const event of api.chat.confirm(currentSessionId, pendingAction.action_id)) {
+        if (event.type === 'thinking') {
+          setThinking(true)
+        } else if (event.type === 'tool_start') {
+          setThinking(false)
+          currentToolActivities.push({
+            tool: event.tool,
+            status: 'running',
+            description: event.description,
+          })
+          setToolActivities([...currentToolActivities])
+        } else if (event.type === 'tool_result') {
+          const idx = currentToolActivities.findIndex(a => a.tool === event.tool && a.status === 'running')
+          if (idx >= 0) {
+            currentToolActivities[idx].status = 'success'
+            currentToolActivities[idx].duration_ms = event.duration_ms
+          }
+          setToolActivities([...currentToolActivities])
+        } else if (event.type === 'tool_error') {
+          const idx = currentToolActivities.findIndex(a => a.tool === event.tool && a.status === 'running')
+          if (idx >= 0) {
+            currentToolActivities[idx].status = 'error'
+          }
+          setToolActivities([...currentToolActivities])
+        } else if (event.type === 'token') {
+          setThinking(false)
+          assistantContent += event.content
+          if (!assistantIdRef.current) {
+            assistantIdRef.current = `assistant-${Date.now()}`
+          }
+          const aid = assistantIdRef.current
+          setMessages(prev => {
+            const existing = prev.find(m => m.id === aid)
+            if (existing) {
+              return prev.map(m => (m.id === aid ? { ...m, content: assistantContent } : m))
+            }
+            return [...prev, { id: aid, role: 'assistant', content: assistantContent }]
+          })
+        } else if (event.type === 'sources') {
+          const aid = assistantIdRef.current
+          if (aid) {
+            setMessages(prev => prev.map(m => (m.id === aid ? { ...m, sources: event.sources } : m)))
+          }
+        } else if (event.type === 'error') {
+          setMessages(prev => [
+            ...prev,
+            { id: `error-${Date.now()}`, role: 'assistant', content: `Error: ${event.content}` },
+          ])
+        }
+      }
+    } catch (err) {
+      setMessages(prev => [
+        ...prev,
+        {
+          id: `error-${Date.now()}`,
+          role: 'assistant',
+          content: `Error: ${err instanceof Error ? err.message : 'Failed to confirm action'}`,
+        },
+      ])
+    } finally {
+      setIsConfirming(false)
+      setPendingAction(null)
+      setThinking(false)
+      setToolActivities(currentToolActivities)
+      refresh()
+    }
+  }
+
+  const handleCancel = async () => {
+    if (!sessionId || !pendingAction || isConfirming) return
+    setIsConfirming(true)
+    try {
+      await api.chat.cancel(sessionId, pendingAction.action_id)
+      setMessages(prev => [
+        ...prev,
+        {
+          id: `cancel-${Date.now()}`,
+          role: 'assistant',
+          content: 'The action was declined and nothing was changed.',
+        },
+      ])
+    } catch {
+      // keep the card visible if the request failed
+    } finally {
+      setIsConfirming(false)
+      setPendingAction(null)
     }
   }
 
@@ -662,6 +807,17 @@ export default function ChatPage() {
               )}
             </div>
 
+            {pendingAction && (
+              <div className="mb-4">
+                <ConfirmationCard
+                  pending={pendingAction}
+                  busy={isConfirming}
+                  onConfirm={handleConfirm}
+                  onCancel={handleCancel}
+                />
+              </div>
+            )}
+
             {thinking && (
               <div className="mt-5 flex items-center gap-2 text-[12px] text-muted">
                 <StatusDot tone="warning" pulse />
@@ -694,7 +850,7 @@ export default function ChatPage() {
                 size="md"
                 variant="secondary"
                 onClick={() => sendMessage(input)}
-                disabled={!input.trim() || isStreaming}
+                disabled={!input.trim() || isStreaming || !!pendingAction || isConfirming}
                 className="h-8 w-9 border-border px-0 text-muted hover:border-primary/40 hover:text-primary"
                 aria-label="Send"
               >
@@ -702,7 +858,9 @@ export default function ChatPage() {
               </Button>
             </div>
             <div className="mt-1.5 flex items-center justify-between px-1">
-              <span className="text-[10.5px] text-faint">Enter to send · Shift+Enter for newline</span>
+              <span className="text-[10.5px] text-faint">
+                {pendingAction ? 'Confirm or decline the action above to continue' : 'Enter to send · Shift+Enter for newline'}
+              </span>
               {isStreaming && toolActivities.length > 0 && (
                 <span className="flex items-center gap-1.5 text-[10.5px] text-muted">
                   <StatusDot tone="warning" pulse />
