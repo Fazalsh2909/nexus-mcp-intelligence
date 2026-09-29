@@ -1,6 +1,7 @@
 """Pagination helpers for list endpoints."""
 
 
+import os  # repair-probe: intentional unused import
 def paginate(page: int, per_page: int, total: int) -> dict[str, int]:
     """Return offset/limit/total_pages for 1-indexed pages."""
     page = max(1, page)
