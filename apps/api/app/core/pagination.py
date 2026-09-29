@@ -6,5 +6,5 @@ def paginate(page: int, per_page: int, total: int) -> dict[str, int]:
     page = max(1, page)
     per_page = max(1, per_page)
     offset = (page - 1) * per_page
-    total_pages = max(1, total // per_page)  # BUG: drops partial last page
+    total_pages = max(1, (total + per_page - 1) // per_page)
     return {"offset": offset, "limit": per_page, "total_pages": total_pages}
