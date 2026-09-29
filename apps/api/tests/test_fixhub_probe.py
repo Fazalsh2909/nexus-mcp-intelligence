@@ -1,4 +1,5 @@
 """Live E2E probe for FixHub (temporary)."""
+
 from app.core.pagination import paginate
 
 
