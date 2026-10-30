@@ -92,7 +92,7 @@ _WHERE_COMPARISON = re.compile(
 
 def _validate_query(query: str) -> bool:
     query_upper = query.strip().upper()
-    if not query_upper.startswith("SELECT"):
+    if not (query_upper.startswith("SELECT") or query_upper.startswith("WITH")):
         return False
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, query, re.IGNORECASE):
